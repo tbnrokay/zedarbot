@@ -1,14 +1,18 @@
 import discord
 from discord.ext import commands
+from discord.ui import Button, View
 
 # Set up intents
 intents = discord.Intents.default()
 intents.message_content = True 
+intents.members = True # Useful for DM systems
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# STORAGE CONFIGURATION
+# CONFIGURATION IDs
 STORAGE_CHANNEL_ID = 1508530457090719874
+PUBLIC_LOG_CHANNEL_ID = 1508522466312585246
+ADMIN_USER_ID = 1454359635229413377
 
 @bot.event
 async def on_ready():
@@ -17,8 +21,111 @@ async def on_ready():
     print(f"----------------------------------------")
 
 # ==========================================
+#        INTERACTIVE INTERACTION VIEWS
+# ==========================================
+
+class ApprovalView(View):
+    """Interactive buttons sent to the admin for approving/denying law firms."""
+    def __init__(self, applicant, ign):
+        super().__init__(timeout=None) # Keeps buttons working indefinitely until pressed
+        self.applicant = applicant
+        self.ign = ign
+
+    @discord.ui.button(label="Accept ✅", style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Disable buttons after click
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(view=self)
+
+        # Notify Public Log Channel
+        log_channel = bot.get_channel(PUBLIC_LOG_CHANNEL_ID)
+        if log_channel:
+            embed = discord.Embed(
+                title="💼 Law Firm Registered Successfully", 
+                color=discord.Color.green()
+            )
+            embed.add_field(name="Firm Owner", value=f"{self.applicant.mention} ({self.applicant.name})", inline=False)
+            embed.add_field(name="Owner Discord ID", value=self.applicant.id, inline=False)
+            embed.add_field(name="Minecraft IGN", value=self.ign, inline=False)
+            embed.add_field(name="Approved By", value=interaction.user.mention, inline=False)
+            await log_channel.send(embed=embed)
+
+        # Notify Applicant via DM
+        try:
+            await self.applicant.send(f"🎉 **Application Approved!** Your law firm registration for the International Court of Zedar has been accepted.")
+        except discord.Forbidden:
+            pass # User has DMs closed
+
+        await interaction.followup.send(f"✅ Approved application for {self.applicant.name}.")
+
+    @discord.ui.button(label="Deny ❌", style=discord.ButtonStyle.danger)
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(view=self)
+
+        # Notify Applicant via DM
+        try:
+            await self.applicant.send(f"❌ **Application Denied:** Your law firm registration application was rejected by the Court administration.")
+        except discord.Forbidden:
+            pass
+
+        await interaction.followup.send(f"❌ Denied application for {self.applicant.name}.")
+
+
+# ==========================================
 #          FUNCTIONAL COMMANDS
 # ==========================================
+
+@bot.command(name="registerlawfirm")
+async def registerlawfirm(ctx):
+    """Starts the law firm registration process via DM."""
+    applicant = ctx.author
+
+    # 1. Slide into their DMs
+    try:
+        await applicant.send("💼 **International Court of Zedar — Law Firm Registration**\nPlease reply to this message with your Minecraft **In-Game Name (IGN)**:")
+        await ctx.send(f"✉️ {applicant.mention}, I've sent you a DM to start your law firm registration.")
+    except discord.Forbidden:
+        await ctx.send(f"❌ {applicant.mention}, I couldn't DM you! Please check your privacy settings and open your DMs.")
+        return
+
+    # 2. Await the DM response
+    def check(m):
+        return m.author == applicant and isinstance(m.channel, discord.DMChannel)
+
+    try:
+        # Give them 5 minutes to reply
+        msg = await bot.wait_for('message', check=check, timeout=300.0)
+        user_ign = msg.content
+    except TimeoutError:
+        try:
+            await applicant.send("❌ Registration timed out. Please run `!registerlawfirm` in the server again if you wish to try later.")
+        except discord.Forbidden:
+            pass
+        return
+
+    # 3. Alert applicant it's pending
+    await applicant.send("⏳ Thank you! Your application has been submitted to Court administration for approval.")
+
+    # 4. DM the Admin for approval
+    admin = await bot.fetch_user(ADMIN_USER_ID)
+    if admin:
+        embed = discord.Embed(
+            title="⚖️ Pending Law Firm Registration", 
+            description="A user is requesting to register a law firm.",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="User", value=f"{applicant.mention} ({applicant.name})", inline=True)
+        embed.add_field(name="User ID", value=applicant.id, inline=True)
+        embed.add_field(name="Submitted Minecraft IGN", value=user_ign, inline=False)
+        
+        view = ApprovalView(applicant, user_ign)
+        await admin.send(embed=embed, view=view)
+    else:
+        print(f"CRITICAL ERROR: Admin user with ID {ADMIN_USER_ID} could not be found.")
+
 
 @bot.command(name="store")
 async def store(ctx, *, message_text: str = None):
@@ -29,19 +136,15 @@ async def store(ctx, *, message_text: str = None):
         await ctx.send("❌ Error: Could not find the storage channel. Check bot permissions or ID.")
         return
 
-    # Check if the user actually sent anything (text or files)
     if not message_text and not ctx.message.attachments:
         await ctx.send("❌ Please provide some text or attach a file to store.")
         return
 
-    # Convert discord attachments into a list of file objects to re-upload
     files_to_send = []
     for attachment in ctx.message.attachments:
-        # This downloads the file into memory and prepares it for sending
         file_obj = await attachment.to_file()
         files_to_send.append(file_obj)
 
-    # Format the log message nicely for the storage channel
     log_content = f"📁 **New Evidence Deposited**\n" \
                   f"**Submitted by:** {ctx.author.mention} ({ctx.author.id})\n" \
                   f"**Channel:** {ctx.channel.mention}\n"
@@ -50,7 +153,6 @@ async def store(ctx, *, message_text: str = None):
         log_content += f"**Message:** {message_text}"
 
     try:
-        # Send everything to the storage channel
         await storage_channel.send(content=log_content, files=files_to_send)
         await ctx.send("✅ Evidence safely logged in the archives.")
     except discord.Forbidden:
@@ -86,10 +188,6 @@ async def purge_error(ctx, error):
 @bot.command(name="sue")
 async def sue(ctx, *args):
     await ctx.send("⚖️ *Lawsuit filed with the court clerk. (Testing Only)*")
-
-@bot.command(name="registerlawfirm")
-async def registerlawfirm(ctx, *args):
-    await ctx.send("💼 *Law firm registration received. pending review... (Testing Only)*")
 
 @bot.command(name="subpoena")
 async def subpoena(ctx, *args):
